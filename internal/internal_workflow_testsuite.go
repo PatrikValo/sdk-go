@@ -1872,6 +1872,43 @@ func (m *mockWrapper) getMockReturnWithActualArgs(ctx interface{}, inputArgs []i
 	return envMock.MethodCalled(m.name, realArgs...)
 }
 
+func (m *mockWrapper) wrapReturnValuesToMockFn(mockRet mock.Arguments) interface{} {
+	fnName := m.name
+	fnType := reflect.TypeOf(m.fn)
+	numOut := fnType.NumOut()
+	mockRetLen := len(mockRet)
+	if mockRetLen != numOut {
+		panic(fmt.Sprintf("mock of %v has incorrect number of returns, expected %d, but actual is %d",
+			fnName, fnType.NumOut(), mockRetLen))
+	}
+
+	providedTypes := make([]reflect.Type, mockRetLen)
+	for i, v := range mockRet {
+		providedTypes[i] = reflect.TypeOf(v)
+	}
+
+	for i := 0; i < numOut; i++ {
+		if mockRet[i] != nil && !providedTypes[i].ConvertibleTo(fnType.Out(i)) {
+			panic(fmt.Sprintf("Provided type %v (%v) is not convertible to %v", providedTypes[i], mockRet[i], fnType.Out(1)))
+		}
+	}
+
+	outValues := make([]reflect.Value, numOut)
+	for i := 0; i < numOut; i++ {
+		if mockRet[i] == nil {
+			outValues[i] = reflect.Zero(fnType.Out(i))
+		} else {
+			outValues[i] = reflect.ValueOf(mockRet[i]).Convert(fnType.Out(i))
+		}
+	}
+
+	newFunc := reflect.MakeFunc(fnType, func(args []reflect.Value) []reflect.Value {
+		return outValues
+	})
+
+	return newFunc.Interface()
+}
+
 func (m *mockWrapper) getMockFn(mockRet mock.Arguments) interface{} {
 	fnName := m.name
 	mockRetLen := len(mockRet)
@@ -1962,17 +1999,19 @@ func (m *mockWrapper) executeMock(ctx interface{}, input *commonpb.Payloads, moc
 
 	fnName := m.name
 	// check if mock returns function which must match to the actual function.
-	if mockFn := m.getMockFn(mockRet); mockFn != nil {
-		// we found a mock function that matches to actual function, so call that mockFn
-		if m.isWorkflow {
-			executor := &workflowExecutor{workflowType: fnName, fn: mockFn}
-			return executor.Execute(ctx.(Context), input)
-		}
-		executor := &activityExecutor{name: fnName, fn: mockFn}
-		return executor.Execute(ctx.(context.Context), input)
+	mockFn := m.getMockFn(mockRet)
+	if mockFn == nil {
+		// return values are provided so we have to wrap them into fn
+		mockFn = m.wrapReturnValuesToMockFn(mockRet)
 	}
 
-	return m.getMockValue(mockRet)
+	// we found a mock function that matches to actual function, so call that mockFn
+	if m.isWorkflow {
+		executor := &workflowExecutor{workflowType: fnName, fn: mockFn}
+		return executor.Execute(ctx.(Context), input)
+	}
+	executor := &activityExecutor{name: fnName, fn: mockFn}
+	return executor.Execute(ctx.(context.Context), input)
 }
 
 func (env *testWorkflowEnvironmentImpl) newTestActivityTaskHandler(taskQueue string, dataConverter converter.DataConverter) ActivityTaskHandler {

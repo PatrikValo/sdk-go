@@ -4240,3 +4240,151 @@ func (s *WorkflowTestSuiteUnitTest) Test_SameWorkflowAndActivityNames() {
 	s.Require().True(env.IsWorkflowCompleted())
 	s.Require().NoError(env.GetWorkflowError())
 }
+
+type checkCallInterceptor struct {
+	InterceptorBase
+	calledActivity int
+	calledWorkflow int
+}
+
+type checkCallActivityInboundInterceptor struct {
+	ActivityInboundInterceptorBase
+	root *checkCallInterceptor
+}
+
+type checkCallWorkflowInboundInterceptor struct {
+	WorkflowInboundInterceptorBase
+	root *checkCallInterceptor
+}
+
+func (e *checkCallInterceptor) InterceptActivity(
+	ctx context.Context,
+	next ActivityInboundInterceptor,
+) ActivityInboundInterceptor {
+	i := &checkCallActivityInboundInterceptor{root: e}
+	i.Next = next
+	return i
+}
+
+func (t *checkCallActivityInboundInterceptor) ExecuteActivity(
+	ctx context.Context,
+	in *ExecuteActivityInput,
+) (interface{}, error) {
+	t.root.calledActivity += 1
+	return t.Next.ExecuteActivity(ctx, in)
+}
+
+func (t *checkCallInterceptor) InterceptWorkflow(
+	ctx Context,
+	next WorkflowInboundInterceptor,
+) WorkflowInboundInterceptor {
+	i := &checkCallWorkflowInboundInterceptor{root: t}
+	i.Next = next
+	return i
+}
+
+func (t *checkCallWorkflowInboundInterceptor) ExecuteWorkflow(
+	ctx Context,
+	in *ExecuteWorkflowInput,
+) (interface{}, error) {
+	t.root.calledWorkflow += 1
+	return t.Next.ExecuteWorkflow(ctx, in)
+}
+
+func (s *WorkflowTestSuiteUnitTest) Test_WorkflowWithActivityMockInterceptor() {
+	interceptor := &checkCallInterceptor{}
+	env := s.NewTestWorkflowEnvironment()
+	env.SetWorkerOptions(
+		WorkerOptions{
+			Interceptors: []WorkerInterceptor{
+				interceptor,
+			},
+		},
+	)
+	env.RegisterWorkflow(testWorkflowHello)
+	env.RegisterActivity(testActivityHello)
+
+	env.OnActivity(testActivityHello, mock.Anything, mock.Anything).Return("mock_value", nil).Once()
+	env.ExecuteWorkflow(testWorkflowHello)
+
+	s.True(env.IsWorkflowCompleted())
+	s.NoError(env.GetWorkflowError())
+	var result string
+	_ = env.GetWorkflowResult(&result)
+	s.Equal("mock_value", result)
+	env.AssertExpectations(s.T())
+	s.Equal(1, interceptor.calledWorkflow)
+	s.Equal(1, interceptor.calledActivity)
+}
+
+func (s *WorkflowTestSuiteUnitTest) Test_WorkflowWithLocalActivityMockInterceptor() {
+	localActivityFn := func(ctx context.Context, name string) (string, error) {
+		return "hello " + name, nil
+	}
+
+	workflowFn := func(ctx Context) (string, error) {
+		ctx = WithLocalActivityOptions(ctx, s.localActivityOptions)
+		var result string
+		f := ExecuteLocalActivity(ctx, localActivityFn, "local_activity")
+		err := f.Get(ctx, &result)
+		return result, err
+	}
+
+	interceptor := &checkCallInterceptor{}
+	env := s.NewTestWorkflowEnvironment()
+	env.SetWorkerOptions(
+		WorkerOptions{
+			Interceptors: []WorkerInterceptor{
+				interceptor,
+			},
+		},
+	)
+
+	env.OnActivity(localActivityFn, mock.Anything, mock.Anything).Return("mock_value", nil).Once()
+	env.ExecuteWorkflow(workflowFn)
+
+	s.True(env.IsWorkflowCompleted())
+	s.NoError(env.GetWorkflowError())
+	var result string
+	err := env.GetWorkflowResult(&result)
+	s.NoError(err)
+	s.Equal("mock_value", result)
+	s.Equal(1, interceptor.calledWorkflow)
+	s.Equal(1, interceptor.calledActivity)
+}
+
+func (s *WorkflowTestSuiteUnitTest) Test_WorkflowWithChildWorkflowMockInterceptor() {
+	workflowFn := func(ctx Context) (string, error) {
+		cwo := ChildWorkflowOptions{WorkflowRunTimeout: time.Minute}
+		ctx = WithChildWorkflowOptions(ctx, cwo)
+		var helloWorkflowResult string
+		err := ExecuteChildWorkflow(ctx, testWorkflowHello).Get(ctx, &helloWorkflowResult)
+		if err != nil {
+			return "", err
+		}
+		return helloWorkflowResult, nil
+	}
+
+	interceptor := &checkCallInterceptor{}
+	env := s.NewTestWorkflowEnvironment()
+	env.SetWorkerOptions(
+		WorkerOptions{
+			Interceptors: []WorkerInterceptor{
+				interceptor,
+			},
+		},
+	)
+
+	env.RegisterWorkflow(testWorkflowHello)
+
+	env.OnWorkflow(testWorkflowHello, mock.Anything, mock.Anything, mock.Anything).Return("mock_hello", nil)
+	env.ExecuteWorkflow(workflowFn)
+
+	s.True(env.IsWorkflowCompleted())
+	s.NoError(env.GetWorkflowError())
+	var actualResult string
+	s.NoError(env.GetWorkflowResult(&actualResult))
+	s.Equal("mock_hello", actualResult)
+	s.Equal(2, interceptor.calledWorkflow)
+	s.Equal(0, interceptor.calledActivity)
+}
